@@ -1,4 +1,7 @@
 import unittest
+import json
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -10,6 +13,8 @@ from backend.main import app
 from backend.routes import quizzes as quiz_routes
 from backend.services.ai_service import AIQuestion, QuizAIResponse
 from backend.services.ai_service import allocate_questions, split_source_text
+from backend.services import ai_service
+from backend.schemas import GenerateQuizRequest
 
 
 class QuizApiTests(unittest.TestCase):
@@ -93,12 +98,34 @@ class QuizApiTests(unittest.TestCase):
         })
         self.assertEqual(result.status_code, 200, result.text)
         self.assertEqual(result.json()["score"], 1)
+        self.assertEqual(result.json()["correct_count"], 1)
+        self.assertEqual(result.json()["incorrect_count"], 1)
         self.assertEqual(result.json()["percentage"], 50.0)
+        self.assertEqual(result.json()["reviews"][0]["selected_answer"], "B")
+        self.assertEqual(result.json()["reviews"][0]["correct_answer"], "B")
+        self.assertTrue(result.json()["reviews"][0]["explanation"])
+
+        all_correct = self.client.post(f"/api/quizzes/{quiz['quiz_id']}/submit", json={"answers": [
+            {"question_id": "q1", "selected_index": 1},
+            {"question_id": "q2", "selected_index": 1},
+        ]})
+        self.assertEqual(all_correct.status_code, 200)
+        self.assertEqual(all_correct.json()["percentage"], 100.0)
+        self.assertTrue(all(item["is_correct"] for item in all_correct.json()["reviews"]))
+
+        all_incorrect = self.client.post(f"/api/quizzes/{quiz['quiz_id']}/submit", json={"answers": [
+            {"question_id": "q1", "selected_index": 0},
+            {"question_id": "q2", "selected_index": 0},
+        ]})
+        self.assertEqual(all_incorrect.status_code, 200)
+        self.assertEqual(all_incorrect.json()["percentage"], 0.0)
+        self.assertEqual(all_incorrect.json()["reviews"][0]["correct_answer"], "B")
+        self.assertTrue(all(item["explanation"] for item in all_incorrect.json()["reviews"]))
 
         history = self.client.get("/api/quizzes/history/list")
         self.assertEqual(history.status_code, 200)
-        self.assertEqual(history.json()[0]["attempts"], 1)
-        self.assertEqual(history.json()[0]["best_score"], 50.0)
+        self.assertEqual(history.json()[0]["attempts"], 3)
+        self.assertEqual(history.json()[0]["best_score"], 100.0)
 
     def test_document_formats_and_invalid_extension(self):
         text = b"Photosynthesis converts light energy into chemical energy inside plants. " * 2
@@ -147,6 +174,39 @@ class QuizApiTests(unittest.TestCase):
         allocations = allocate_questions([len(chunk) for chunk in chunks], len(chunks) + 5)
         self.assertEqual(sum(allocations), len(chunks) + 5)
         self.assertTrue(all(count >= 1 for count in allocations))
+
+    def test_gemini_response_retries_once_for_missing_explanation_quality(self):
+        request = GenerateQuizRequest(topic="Photosynthesis", question_count=1, difficulty="Medium")
+        invalid = json.dumps({"title": "Quiz", "questions": [{
+            "question": "What does chlorophyll absorb?",
+            "options": ["Light", "Sound", "Heat", "Salt"],
+            "correct_index": 0,
+            "explanation": "Because this is correct.",
+        }]})
+        valid = json.dumps({"title": "Quiz", "questions": [{
+            "question": "What does chlorophyll absorb?",
+            "options": ["Light", "Sound", "Heat", "Salt"],
+            "correct_index": 0,
+            "explanation": "Chlorophyll absorbs light at wavelengths that power photosynthesis. The captured energy helps convert water and carbon dioxide into glucose, while oxygen is released.",
+        }]})
+        class FakeModels:
+            def __init__(self):
+                self.calls = []
+            def generate_content(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(text=invalid if len(self.calls) == 1 else valid)
+
+        models = FakeModels()
+        fake_client = SimpleNamespace(models=models, close=lambda: None)
+        with patch.object(ai_service.genai, "Client", return_value=fake_client):
+            response = ai_service._generate_sync("Photosynthesis", request, "topic")
+
+        self.assertEqual(len(models.calls), 2)
+        self.assertIn("CORRECTION RETRY", models.calls[1]["contents"])
+        self.assertEqual(response.questions[0].correct_index, 0)
+        self.assertGreaterEqual(len(response.questions[0].explanation), 40)
+        fenced = ai_service._parse_ai_response(f"```json\n{valid}\n```")
+        self.assertEqual(fenced.questions[0].correct_index, 0)
 
 
 if __name__ == "__main__":

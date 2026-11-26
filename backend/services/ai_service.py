@@ -13,9 +13,9 @@ from backend.services.prompt_engine import build_quiz_prompt
 
 class AIQuestion(BaseModel):
     question: str = Field(min_length=1, description="The question text")
-    options: list[str] = Field(description="Answer choices")
+    options: list[str] = Field(description="Ordered answer choices; MCQ option positions correspond to A, B, C, D")
     correct_index: int = Field(ge=0, description="Zero-based index of the correct option")
-    explanation: str = Field(min_length=1, description="Short explanation of the correct answer")
+    explanation: str = Field(min_length=1, description="Meaningful explanation of why the correct option is right")
 
 
 class QuizAIResponse(BaseModel):
@@ -29,6 +29,71 @@ class AIConfigurationError(RuntimeError):
 
 class AIProviderError(RuntimeError):
     pass
+
+
+class QuizContentValidationError(ValueError):
+    pass
+
+
+def _clean_quiz_questions(data: QuizAIResponse, settings: GenerateQuizRequest) -> list[AIQuestion]:
+    expected_options = 2 if settings.question_type.value == "True or False" else 4
+    cleaned: list[AIQuestion] = []
+    seen_questions: set[str] = set()
+
+    for index, item in enumerate(data.questions, start=1):
+        question = " ".join(item.question.split())
+        options = [" ".join(option.split()) for option in item.options]
+        label = f"Question {index}"
+        if not question:
+            raise QuizContentValidationError(f"{label} has empty question text.")
+        if len(options) != expected_options or any(not option for option in options):
+            raise QuizContentValidationError(f"{label} must have exactly {expected_options} non-empty options.")
+        if len({option.casefold() for option in options}) != expected_options:
+            raise QuizContentValidationError(f"{label} contains duplicate options.")
+        if item.correct_index >= len(options):
+            raise QuizContentValidationError(f"{label} has a correct answer outside its options.")
+
+        explanation = " ".join(item.explanation.split())
+        if len(explanation) < 40:
+            raise QuizContentValidationError(f"{label} explanation is too short to teach the concept.")
+        if re.search(r"\b(because (this|it) is (the )?correct|because that is the answer)\b", explanation, re.I):
+            raise QuizContentValidationError(f"{label} explanation is a placeholder instead of reasoning.")
+        sentence_count = len([part for part in re.split(r"(?<=[.!?।])(?:\s+|$)", explanation) if part.strip()])
+        if sentence_count < 2 or sentence_count > 6:
+            raise QuizContentValidationError(f"{label} explanation must contain 2–5 meaningful sentences.")
+
+        normalized = question.casefold()
+        if normalized in seen_questions:
+            raise QuizContentValidationError(f"{label} duplicates another question.")
+        seen_questions.add(normalized)
+        cleaned.append(AIQuestion(
+            question=question,
+            options=options,
+            correct_index=item.correct_index,
+            explanation=explanation,
+        ))
+
+    if len(cleaned) != settings.question_count:
+        raise QuizContentValidationError(
+            f"Expected {settings.question_count} questions but received {len(cleaned)}."
+        )
+    return cleaned
+
+
+def _validation_summary(error: ValidationError) -> str:
+    issues = error.errors(include_input=False)
+    return "; ".join(
+        f"{'.'.join(str(part) for part in issue['loc']) or 'response'}: {issue['msg']}"
+        for issue in issues[:3]
+    ) or "response did not match the required schema"
+
+
+def _parse_ai_response(output_text: str) -> QuizAIResponse:
+    candidate = output_text.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, flags=re.I | re.S)
+    if fenced:
+        candidate = fenced.group(1).strip()
+    return QuizAIResponse.model_validate_json(candidate)
 
 
 def _generate_sync(source_text: str, settings: GenerateQuizRequest, source_type: str) -> QuizAIResponse:
@@ -51,22 +116,44 @@ def _generate_sync(source_text: str, settings: GenerateQuizRequest, source_type:
                 ),
             ),
         )
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=build_quiz_prompt(source_text, settings, source_type),
-            config=types.GenerateContentConfig(
-                temperature=0.35,
-                max_output_tokens=min(32_768, 1_024 + settings.question_count * 700),
-                response_mime_type="application/json",
-                response_schema=QuizAIResponse,
-                thinking_config=types.ThinkingConfig(
-                    thinking_level=types.ThinkingLevel.LOW,
+        base_prompt = build_quiz_prompt(source_text, settings, source_type)
+        correction = ""
+        last_issue = "Gemini returned an empty response."
+        for attempt in range(2):
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=base_prompt + correction,
+                config=types.GenerateContentConfig(
+                    temperature=0.35,
+                    max_output_tokens=min(32_768, 1_024 + settings.question_count * 700),
+                    response_mime_type="application/json",
+                    response_schema=QuizAIResponse,
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level=types.ThinkingLevel.LOW,
+                    ),
                 ),
-            ),
+            )
+            if not response.text:
+                last_issue = "Gemini returned an empty response."
+            else:
+                try:
+                    data = _parse_ai_response(response.text)
+                    data.questions = _clean_quiz_questions(data, settings)
+                    return data
+                except ValidationError as exc:
+                    last_issue = _validation_summary(exc)
+                except QuizContentValidationError as exc:
+                    last_issue = str(exc)
+
+            if attempt == 0:
+                correction = (
+                    "\n\nCORRECTION RETRY: Your previous JSON response was rejected because: "
+                    f"{last_issue} Regenerate the entire response, repair this issue, and return only "
+                    "complete JSON matching the schema. Do not omit or guess any answer or explanation."
+                )
+        raise AIProviderError(
+            f"Gemini returned an invalid quiz after one correction retry: {last_issue}"
         )
-        if not response.text:
-            raise AIProviderError("Gemini returned an empty response. Try a shorter topic or document.")
-        data = QuizAIResponse.model_validate_json(response.text)
     except AIProviderError:
         raise
     except ValidationError as exc:
@@ -99,40 +186,6 @@ def _generate_sync(source_text: str, settings: GenerateQuizRequest, source_type:
     finally:
         if client is not None:
             client.close()
-
-    expected_options = 2 if settings.question_type.value == "True or False" else 4
-    cleaned: list[AIQuestion] = []
-    seen_questions: set[str] = set()
-    for item in data.questions:
-        question = " ".join(item.question.split())
-        options = [" ".join(option.split()) for option in item.options]
-        normalized = question.casefold()
-        if not question or normalized in seen_questions:
-            continue
-        if len(options) != expected_options or any(not option for option in options):
-            continue
-        if len({option.casefold() for option in options}) != expected_options:
-            continue
-        if item.correct_index >= len(options):
-            continue
-        if not item.explanation.strip():
-            continue
-        seen_questions.add(normalized)
-        cleaned.append(AIQuestion(
-            question=question,
-            options=options,
-            correct_index=item.correct_index,
-            explanation=item.explanation.strip(),
-        ))
-
-    if len(cleaned) != settings.question_count:
-        raise AIProviderError(
-            f"Gemini returned {len(cleaned)} valid questions, but {settings.question_count} were requested. "
-            "Try a broader topic or more detailed notes."
-        )
-    data.questions = cleaned
-    return data
-
 
 async def generate_quiz(source_text: str, settings: GenerateQuizRequest, source_type: str) -> QuizAIResponse:
     if source_type != "notes" or len(source_text) <= MAX_SOURCE_CHARS:

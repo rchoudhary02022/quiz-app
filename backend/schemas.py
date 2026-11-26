@@ -51,7 +51,9 @@ class QuestionReview(BaseModel):
     question: str
     options: list[str]
     selected_index: int | None
+    selected_answer: str | None
     correct_index: int
+    correct_answer: str
     is_correct: bool
     explanation: str
 
@@ -60,6 +62,8 @@ class QuizResultResponse(BaseModel):
     quiz_id: str
     score: int
     total: int
+    correct_count: int
+    incorrect_count: int
     percentage: float
     feedback: str
     reviews: list[QuestionReview]

@@ -1,4 +1,5 @@
 import json
+import asyncio
 from uuid import uuid4
 from pathlib import Path
 
@@ -105,7 +106,7 @@ async def generate_from_file(
         limit_mb = max(1, MAX_UPLOAD_BYTES // (1024 * 1024))
         raise HTTPException(status_code=413, detail=f"File exceeds the {limit_mb} MB upload limit.")
     try:
-        extracted = extract_text(filename, content)
+        extracted = await asyncio.to_thread(extract_text, filename, content)
     except DocumentReadError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -163,7 +164,9 @@ def submit_quiz(quiz_id: str, payload: SubmitQuizRequest, db: Session = Depends(
             question=question["question"],
             options=question["options"],
             selected_index=selected,
+            selected_answer=chr(ord("A") + selected),
             correct_index=question["correct_index"],
+            correct_answer=chr(ord("A") + question["correct_index"]),
             is_correct=correct,
             explanation=question["explanation"],
         ))
@@ -182,6 +185,8 @@ def submit_quiz(quiz_id: str, payload: SubmitQuizRequest, db: Session = Depends(
         quiz_id=quiz_id,
         score=score,
         total=total,
+        correct_count=score,
+        incorrect_count=total - score,
         percentage=percentage,
         feedback=feedback,
         reviews=reviews,

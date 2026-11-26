@@ -250,12 +250,18 @@ function renderResult(result) {
     <article class="review-item ${review.is_correct ? 'is-correct' : 'is-wrong'}">
       <div class="review-heading"><span>Q${String(index + 1).padStart(2, '0')}</span><b>${review.is_correct ? 'CORRECT' : 'REVIEW THIS'}</b></div>
       <h4>${escapeHTML(review.question)}</h4>
-      <p class="review-answer">Correct answer: <strong>${escapeHTML(review.options[review.correct_index])}</strong></p>
-      <p class="review-explanation">${escapeHTML(review.explanation)}</p>
+      <div class="review-answers">
+        <p class="review-selection ${review.is_correct ? 'answer-correct' : 'answer-incorrect'}">YOUR ANSWER <strong>${escapeHTML(review.selected_answer || '—')}${review.selected_index == null ? '' : ` · ${escapeHTML(review.options[review.selected_index])}`}</strong></p>
+        <p class="review-answer answer-correct">CORRECT ANSWER <strong>${escapeHTML(review.correct_answer || String.fromCharCode(65 + review.correct_index))} · ${escapeHTML(review.options[review.correct_index])}</strong></p>
+      </div>
+      <p class="review-explanation"><b>WHY</b> ${escapeHTML(review.explanation)}</p>
     </article>`).join('');
+  const correctCount = result.correct_count ?? result.score;
+  const incorrectCount = result.incorrect_count ?? (result.total - result.score);
   resultBox.innerHTML = `
-    <div class="result-summary"><div class="result-score"><strong>${result.percentage}%</strong><span>${result.score} / ${result.total} CORRECT</span></div>
-    <div><div class="eyebrow">SESSION COMPLETE</div><h3>${escapeHTML(result.feedback)}</h3><p>Review the explanations below to strengthen your understanding.</p></div></div>
+    <div class="result-summary"><div class="result-score"><strong>${Number(result.percentage).toFixed(1).replace(/\.0$/, '')}%</strong><span>${result.score} / ${result.total} CORRECT</span></div>
+    <div><div class="eyebrow">SESSION COMPLETE</div><h3>${escapeHTML(result.feedback)}</h3><p>${correctCount} correct · ${incorrectCount} incorrect · ${result.total} questions</p></div></div>
+    <div class="review-title"><div class="eyebrow">ANSWER KEY & EXPLANATIONS</div><h3>Review answers</h3></div>
     <div class="review-list">${reviewHTML}</div>
     <button class="quiz-retry" id="quizRetry">CREATE ANOTHER QUIZ ↗</button>`;
   resultBox.classList.remove('hidden');
